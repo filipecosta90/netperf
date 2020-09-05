@@ -4,13 +4,13 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"github.com/filipecosta90/hdrhistogram"
+	"github.com/pkg/profile"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/pkg/profile"
 )
 
 type senderConfig struct {
@@ -117,6 +117,7 @@ func senderRun(cmdName string, config senderConfig) error {
 		outlog.Printf("duration:                       %s\n", report.duration)
 		outlog.Printf("streams:                        %d\n", report.numWorkers)
 		outlog.Printf("data volume:                    %.2f MiB\n", report.dataVolume)
+		outlog.Printf("p50 latency:             			%d micros\n", report.latencyHistogram.TotalCount())
 		outlog.Printf("aggregated throughput:          %.2f MiB/sec\n", report.aggregateThroughput)
 		outlog.Printf("avg/std throughput per stream:  %.2f / %.2f MiB/sec\n", report.avgStreamThroughput, report.stdStreamThroughput)
 	}
@@ -184,9 +185,18 @@ type summaryReport struct {
 	stdStreamThroughput float64 // MiB/sec
 	duration            time.Duration
 	errors              []error
+	latencyHistogram    hdrhistogram.Histogram
 }
 
 func collectWorkerResponses(responses <-chan *workerResponse, summary chan<- summaryReport) {
+	// This latency Histogram could be used to track and analyze the counts of
+	// observed integer values between 0 us and 30000000 us ( 30 secs )
+	// while maintaining a value precision of 3 significant digits across that range,
+	// translating to a value resolution of :
+	//   - 1 microsecond up to 1 millisecond,
+	//   - 1 millisecond (or better) up to one second,
+	//   - 1 second (or better) up to it's maximum tracked value ( 30 seconds ).
+	latencyHistogram := hdrhistogram.New(1, 30000000, 3)
 	dataVolume := float64(0)
 	numWorkers := 0
 	start := time.Now().Add(3000 * time.Hour)
@@ -195,6 +205,8 @@ func collectWorkerResponses(responses <-chan *workerResponse, summary chan<- sum
 	errors := make([]error, 0, 128)
 	for resp := range responses {
 		numWorkers += 1
+		// record each sample duration with microsecond precision
+		latencyHistogram.RecordValue(resp.end.Sub(resp.end).Microseconds())
 		if resp.start.Before(start) {
 			start = resp.start
 		}
@@ -217,6 +229,7 @@ func collectWorkerResponses(responses <-chan *workerResponse, summary chan<- sum
 		stdStreamThroughput: std,
 		duration:            end.Sub(start),
 		errors:              errors,
+		latencyHistogram:    *latencyHistogram,
 	}
 }
 
